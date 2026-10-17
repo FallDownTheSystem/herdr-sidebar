@@ -4,7 +4,9 @@
 # to the historical source build instead of making installation less reliable.
 set -u
 
-repo="alexarthurs/herdr-sidebar"
+# This fork's code differs from upstream releases of the same version, so only
+# its own releases may stand in for a source build.
+repo="FallDownTheSystem/herdr-sidebar"
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 test_mode=${HS_TEST_MODE:-0}
 if [ "$test_mode" = 1 ]; then

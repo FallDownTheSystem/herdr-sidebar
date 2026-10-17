@@ -14,7 +14,9 @@ if ($PSVersionTable.PSVersion.Major -le 5) {
     ) -join ';'
 }
 
-$Repo = 'alexarthurs/herdr-sidebar'
+# This fork's code differs from upstream releases of the same version, so only
+# its own releases may stand in for a source build.
+$Repo = 'FallDownTheSystem/herdr-sidebar'
 $TestMode = $env:HS_TEST_MODE -eq '1'
 function Remove-HsVerbatimPrefix([string]$Path) {
     if ($Path -and $Path.StartsWith('\\?\')) { return $Path.Substring(4) }

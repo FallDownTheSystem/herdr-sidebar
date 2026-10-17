@@ -708,6 +708,31 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether every pane sharing `pane_id`'s tab is one of our sidebar panes
+/// (vacuously true when `pane_id` is alone). Closing `pane_id` would then
+/// leave a tab holding nothing but a sidebar, which docks into every tab.
+pub fn only_sidebars_beside(pane_list_json: &str, pane_id: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return false;
+    };
+    let Some(tab) = msg
+        .result
+        .panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))
+        .and_then(|p| p.tab_id.as_deref())
+    else {
+        return false;
+    };
+    msg.result
+        .panes
+        .iter()
+        .filter(|p| p.tab_id.as_deref() == Some(tab) && p.pane_id.as_deref() != Some(pane_id))
+        .all(|p| {
+            p.tokens.contains_key(METADATA_SOURCE) || p.tokens.contains_key(SC_METADATA_SOURCE)
+        })
+}
+
 /// Any pane living in `tab_id` ("" when the tab is empty or unknown). The
 /// preview flow needs one because herdr 0.9 moves the VIEWING client only on
 /// `pane.focus`; `tab.focus` updates the session-wide record and nothing else.
@@ -1213,6 +1238,23 @@ mod tests {
 
     fn pane_list(panes: &str) -> String {
         format!(r#"{{"id":"cli:pane:list","result":{{"panes":[{panes}]}}}}"#)
+    }
+
+    #[test]
+    fn only_sidebars_beside_ignores_our_panes_and_other_tabs() {
+        let list = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1"},
+               {"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-sidebar-explorer":"1"}},
+               {"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{"herdr-sidebar-git":"1"}},
+               {"pane_id":"w1:p4","tab_id":"w1:t2"},
+               {"pane_id":"w1:p5","tab_id":"w1:t3"},
+               {"pane_id":"w1:p6","tab_id":"w1:t3"}"#,
+        );
+        assert!(only_sidebars_beside(&list, "w1:p1"), "beside sidebars only");
+        assert!(only_sidebars_beside(&list, "w1:p4"), "alone in its tab");
+        assert!(!only_sidebars_beside(&list, "w1:p5"), "beside a user pane");
+        assert!(!only_sidebars_beside(&list, "w9:p9"), "unknown pane");
+        assert!(!only_sidebars_beside("garbage", "w1:p1"));
     }
 
     #[test]

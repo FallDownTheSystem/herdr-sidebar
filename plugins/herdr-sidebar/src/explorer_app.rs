@@ -1367,7 +1367,11 @@ impl App {
         let in_repo = target
             .as_ref()
             .is_some_and(|(path, _)| Git::owner_of(path).is_ok());
-        let entries = actions::menu_entries(target.as_ref().map(|(_, is_dir)| *is_dir), in_repo);
+        let entries = actions::menu_entries(
+            target.as_ref().map(|(_, is_dir)| *is_dir),
+            in_repo,
+            actions::configured_editor().is_some(),
+        );
         let selected = entries
             .iter()
             .position(|e| matches!(e, MenuEntry::Action(..)))
@@ -2835,6 +2839,10 @@ impl App {
             MenuAction::Stage => {
                 let Some((path, _)) = target else { return };
                 self.stage(&path);
+            }
+            MenuAction::OpenInEditor => {
+                let Some((path, _)) = target else { return };
+                self.open_custom_editor(&path);
             }
             MenuAction::Reveal => {
                 let (path, directory) = target.unwrap_or_else(|| (self.tree.root_path(), true));
@@ -4801,7 +4809,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
-        let entries = actions::menu_entries(Some(false), true);
+        let entries = actions::menu_entries(Some(false), true, false);
         // First entry is an action; stepping up from it stays put.
         assert_eq!(step_menu(&entries, 0, -1), 0);
         // Stepping down over a separator lands on the next action.

@@ -15,6 +15,8 @@ pub enum MenuAction {
     Delete,
     /// `git add` the target — the Explorer's staging entry (issue #20).
     Stage,
+    /// Open the file in the configured custom editor, in a tab of its own.
+    OpenInEditor,
     OpenExternal,
     Reveal,
     ChangeFolder,
@@ -32,19 +34,27 @@ pub enum MenuEntry {
 /// root: creation only). "Open with Default App" is offered for files only —
 /// a directory's shell association is the file manager, which is what
 /// "Reveal in File Explorer" already does. `in_repo` adds "Stage Changes"
-/// (issue #20) — it stays out of the menu entirely when the target is not
-/// inside a git repository, so the entry never offers an action that can only
-/// fail.
-pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
+/// (issue #20) and `has_editor` adds "Open in Editor" for files; each stays
+/// out of the menu entirely when its precondition fails (not inside a git
+/// repository, no custom editor configured), so no entry offers an action
+/// that can only fail.
+pub fn menu_entries(target: Option<bool>, in_repo: bool, has_editor: bool) -> Vec<MenuEntry> {
     let mut entries = vec![
         MenuEntry::Action(MenuAction::NewFile, "New File…"),
         MenuEntry::Action(MenuAction::NewFolder, "New Folder…"),
     ];
     if target == Some(false) {
-        entries.extend([
-            MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::OpenExternal, "Open with Default App"),
-        ]);
+        entries.push(MenuEntry::Separator);
+        if has_editor {
+            entries.push(MenuEntry::Action(
+                MenuAction::OpenInEditor,
+                "Open in Editor",
+            ));
+        }
+        entries.push(MenuEntry::Action(
+            MenuAction::OpenExternal,
+            "Open with Default App",
+        ));
     }
     if target.is_some() && in_repo {
         entries.extend([
@@ -610,12 +620,32 @@ pub fn run_configured_editor() -> io::Result<()> {
     }
     let status = status?;
     if status.success() {
+        if !pane_id.is_empty() {
+            close_finished_editor(&pane_id);
+        }
         Ok(())
     } else {
         Err(io::Error::other(format!(
             "{} exited with {status}",
             argv[0]
         )))
+    }
+}
+
+/// Close an editor's pane once the editor exits cleanly; a failed exit keeps
+/// it open so the error stays readable. The sidebar docks into every new tab,
+/// so when only sidebars share the tab the whole tab closes instead of leaving
+/// a lone sidebar behind. Any other pane keeps the tab open. Closing the pane
+/// ends this process, so this is the last thing it does.
+fn close_finished_editor(pane_id: &str) {
+    let Ok(panes) = crate::ipc::call_text("pane.list", serde_json::json!({})) else {
+        return;
+    };
+    let tab_id = crate::launch::tab_of(&panes, pane_id);
+    if !tab_id.is_empty() && crate::launch::only_sidebars_beside(&panes, pane_id) {
+        let _ = crate::ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+    } else {
+        let _ = crate::ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
     }
 }
 
@@ -865,10 +895,10 @@ mod tests {
 
     #[test]
     fn menu_shape_for_rows_and_root() {
-        let row = menu_entries(Some(false), true);
+        let row = menu_entries(Some(false), true, false);
         assert!(matches!(row[0], MenuEntry::Action(MenuAction::NewFile, _)));
         assert!(has(&row, MenuAction::Delete));
-        let root = menu_entries(None, true);
+        let root = menu_entries(None, true, false);
         assert!(!has(&root, MenuAction::Rename));
         assert!(has(&root, MenuAction::Reveal));
     }
@@ -876,40 +906,87 @@ mod tests {
     #[test]
     fn open_external_is_offered_for_files_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::OpenExternal),
+            has(
+                &menu_entries(Some(false), true, false),
+                MenuAction::OpenExternal
+            ),
             "file row"
         );
         assert!(
-            !has(&menu_entries(Some(true), true), MenuAction::OpenExternal),
+            !has(
+                &menu_entries(Some(true), true, false),
+                MenuAction::OpenExternal
+            ),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::OpenExternal),
+            !has(&menu_entries(None, true, false), MenuAction::OpenExternal),
             "empty space"
         );
         // Directories keep everything else they had.
-        assert!(has(&menu_entries(Some(true), true), MenuAction::Rename));
+        assert!(has(
+            &menu_entries(Some(true), true, false),
+            MenuAction::Rename
+        ));
     }
 
     #[test]
     fn stage_is_offered_for_rows_inside_a_repo_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::Stage),
+            has(&menu_entries(Some(false), true, false), MenuAction::Stage),
             "file row"
         );
         assert!(
-            has(&menu_entries(Some(true), true), MenuAction::Stage),
+            has(&menu_entries(Some(true), true, false), MenuAction::Stage),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::Stage),
+            !has(&menu_entries(None, true, false), MenuAction::Stage),
             "empty space"
         );
         assert!(
-            !has(&menu_entries(Some(false), false), MenuAction::Stage),
+            !has(&menu_entries(Some(false), false, false), MenuAction::Stage),
             "outside a repo"
         );
-        assert!(!has(&menu_entries(Some(true), false), MenuAction::Stage));
+        assert!(!has(
+            &menu_entries(Some(true), false, false),
+            MenuAction::Stage
+        ));
+    }
+
+    #[test]
+    fn open_in_editor_is_offered_for_files_with_an_editor_only() {
+        let file = menu_entries(Some(false), true, true);
+        assert!(has(&file, MenuAction::OpenInEditor), "file row");
+        let editor = file
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Action(MenuAction::OpenInEditor, _)));
+        let external = file
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Action(MenuAction::OpenExternal, _)));
+        assert_eq!(
+            editor.map(|i| i + 1),
+            external,
+            "sits right above Open with Default App"
+        );
+        assert!(
+            !has(
+                &menu_entries(Some(false), true, false),
+                MenuAction::OpenInEditor
+            ),
+            "no editor configured"
+        );
+        assert!(
+            !has(
+                &menu_entries(Some(true), true, true),
+                MenuAction::OpenInEditor
+            ),
+            "directory row"
+        );
+        assert!(
+            !has(&menu_entries(None, true, true), MenuAction::OpenInEditor),
+            "empty space"
+        );
     }
 
     #[test]
