@@ -336,8 +336,12 @@ pub struct App {
     /// from the Search view, restored with its query when the modal closes so
     /// the panel doesn't silently drop back to the tree.
     suspended_search: Option<Overlay>,
-    /// Transient status/error line shown in the footer until the next action.
+    /// Transient status/error line shown in the footer until the next action
+    /// or until it expires; set it only through [`App::set_notice`].
     notice: Option<String>,
+    /// When `notice` was set. Nothing else clears it once its action is over
+    /// (an editor tab closed elsewhere sends the sidebar no input).
+    notice_at: std::time::Instant,
     // Merged-sidebar state.
     sidebar_state: sidebar::State,
     other_exe: Option<std::path::PathBuf>,
@@ -401,6 +405,16 @@ pub struct App {
 
 /// How long two clicks on the same row still count as a double click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// How long a footer notice stays without further input.
+const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a notice shown for `age` has outlived [`NOTICE_LIFETIME`]. The
+/// folder picker's notice stays while its dialog is open, because it tells
+/// the user to look for that dialog.
+fn notice_expired(age: std::time::Duration, picking: bool) -> bool {
+    !picking && age >= NOTICE_LIFETIME
+}
 
 /// Activity-bar click zones from the last draw: the bar's row and the column
 /// ranges of the explorer / source-control icons.
@@ -487,6 +501,7 @@ impl App {
             overlay: None,
             suspended_search: None,
             notice: None,
+            notice_at: std::time::Instant::now(),
             sidebar_state,
             other_exe,
             activity: ActivityZones::default(),
@@ -532,6 +547,7 @@ impl App {
     /// the sidebar (an agent editing files, a commit in another pane) show up
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
+        self.expire_notice();
         self.sync_shared_settings();
         self.sync_shared_tree();
         self.collect_quick_index();
@@ -547,6 +563,18 @@ impl App {
 
     pub fn is_syncing(&self) -> bool {
         self.git_syncing.is_some()
+    }
+
+    fn set_notice(&mut self, notice: String) {
+        self.notice = Some(notice);
+        self.notice_at = std::time::Instant::now();
+    }
+
+    fn expire_notice(&mut self) {
+        if self.notice.is_some() && notice_expired(self.notice_at.elapsed(), self.picking.is_some())
+        {
+            self.notice = None;
+        }
     }
 
     /// A separated Source Control pane can change this shared setting while
@@ -780,7 +808,7 @@ impl App {
                 state.active = MY_VIEW;
             });
             self.apply_identity();
-            self.notice = Some("Source Control stayed open; unified mode cancelled".into());
+            self.set_notice("Source Control stayed open; unified mode cancelled".into());
         }
         false
     }
@@ -840,7 +868,7 @@ impl App {
 
     fn open_preview_at(&mut self, path: &Path, line: Option<usize>) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
-            self.notice = Some("preview needs a herdr pane".into());
+            self.set_notice("preview needs a herdr pane".into());
             return;
         };
         let payload = line
@@ -856,7 +884,7 @@ impl App {
             // Remember where it landed: a double click pins THIS tab rather
             // than re-opening, which would race the viewer's first stamp.
             Ok(target) => self.last_preview = Some((doc_key, target)),
-            Err(e) => self.notice = Some(e),
+            Err(e) => self.set_notice(e),
         }
     }
 
@@ -876,19 +904,19 @@ impl App {
             let tab = match herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
                 Ok(json) => herdr_sidebar::launch::tab_of(&json, &ctl.pane_id),
                 Err(e) => {
-                    self.notice = Some(format!("hide failed: {e}"));
+                    self.set_notice(format!("hide failed: {e}"));
                     return;
                 }
             };
             if tab.is_empty() {
-                self.notice = Some("hide failed: could not resolve this tab".into());
+                self.set_notice("hide failed: could not resolve this tab".into());
                 return;
             }
             // Set the marker BEFORE closing: if it fails, closing anyway
             // would let the very next focus event re-dock a sidebar the
             // user just asked to hide.
             if let Err(e) = herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab) {
-                self.notice = Some(format!("hide failed: {e}"));
+                self.set_notice(format!("hide failed: {e}"));
                 return;
             }
         }
@@ -926,7 +954,7 @@ impl App {
                         state.active = MY_VIEW;
                     });
                     self.apply_identity();
-                    self.notice = Some(format!("unified mode cancelled: {error}"));
+                    self.set_notice(format!("unified mode cancelled: {error}"));
                 }
             }
         } else {
@@ -1269,7 +1297,7 @@ impl App {
                     match self.last_preview.as_ref() {
                         Some((key, target)) if *key == doc_key => {
                             if !herdr_sidebar::viewer::pin_target(target, &doc_key) {
-                                self.notice = Some(
+                                self.set_notice(
                                     "preview switch blocked; resolve unsaved changes in its tab"
                                         .into(),
                                 );
@@ -1746,7 +1774,7 @@ impl App {
                 self.overlay = None;
                 match actions::delete(&path, is_dir) {
                     Ok(()) => self.refresh_tree(),
-                    Err(err) => self.notice = Some(format!("delete failed: {err}")),
+                    Err(err) => self.set_notice(format!("delete failed: {err}")),
                 }
             }
             Cmd::Picker(action) => self.handle_picker_action(action),
@@ -1879,7 +1907,7 @@ impl App {
                 self.suspend_search_for_modal();
                 self.overlay = Some(Overlay::BranchPicker(picker));
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.set_notice(error),
         }
     }
 
@@ -1894,10 +1922,10 @@ impl App {
                 };
                 match picker.git.checkout_branch(&branch) {
                     Ok(()) => {
-                        self.notice = Some(format!("switched to {}", branch.name));
+                        self.set_notice(format!("switched to {}", branch.name));
                         self.refresh_tree();
                     }
-                    Err(error) => self.notice = Some(error),
+                    Err(error) => self.set_notice(error),
                 }
                 self.overlay = self.suspended_search.take();
             }
@@ -1907,10 +1935,10 @@ impl App {
                 };
                 match picker.git.create_branch(&name) {
                     Ok(()) => {
-                        self.notice = Some(format!("created {name}"));
+                        self.set_notice(format!("created {name}"));
                         self.refresh_tree();
                     }
-                    Err(error) => self.notice = Some(error),
+                    Err(error) => self.set_notice(error),
                 }
                 self.overlay = self.suspended_search.take();
             }
@@ -1925,7 +1953,7 @@ impl App {
             return;
         };
         if !status.has_upstream {
-            self.notice = Some("no upstream to sync with".into());
+            self.set_notice("no upstream to sync with".into());
             return;
         }
         let Some(git) = self.repos.first().cloned() else {
@@ -1943,16 +1971,16 @@ impl App {
         match rx.try_recv() {
             Ok(Ok(summary)) => {
                 self.git_syncing = None;
-                self.notice = Some(summary);
+                self.set_notice(summary);
                 self.request_decorations(true);
             }
             Ok(Err(error)) => {
                 self.git_syncing = None;
-                self.notice = Some(error);
+                self.set_notice(error);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.git_syncing = None;
-                self.notice = Some("sync failed".into());
+                self.set_notice("sync failed".into());
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -2396,14 +2424,14 @@ impl App {
             .as_ref()
             .map(|control| control.pane_id.clone())
         else {
-            self.notice = Some("custom editor needs a herdr pane".into());
+            self.set_notice("custom editor needs a herdr pane".into());
             return;
         };
         let name = path
             .file_name()
             .unwrap_or(path.as_os_str())
             .to_string_lossy();
-        self.notice = Some(
+        self.set_notice(
             match actions::open_in_editor_tab(&pane_id, &self.tree.root_path(), path) {
                 Ok(()) => format!("opened in custom editor: {name}"),
                 Err(error) => format!("custom editor failed: {error}"),
@@ -2588,7 +2616,7 @@ impl App {
         match setting {
             Setting::Version => {}
             Setting::Update => {
-                self.notice = Some(
+                self.set_notice(
                     herdr_sidebar::updates::activate()
                         .map(|_| "Update requested".into())
                         .unwrap_or_else(|error| error),
@@ -2801,7 +2829,7 @@ impl App {
                         .display()
                         .to_string()
                 };
-                self.notice = Some(match actions::copy_to_clipboard(&text) {
+                self.set_notice(match actions::copy_to_clipboard(&text) {
                     Ok(actions::ClipboardWrite::Native) => format!("copied: {text}"),
                     Ok(actions::ClipboardWrite::Osc52Unacknowledged) => {
                         format!("sent to terminal clipboard: {text}")
@@ -2831,7 +2859,7 @@ impl App {
                     .file_name()
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy();
-                self.notice = Some(match actions::open_external(&path) {
+                self.set_notice(match actions::open_external(&path) {
                     Ok(()) => format!("opened: {name}"),
                     Err(err) => format!("open failed: {err}"),
                 });
@@ -2867,7 +2895,7 @@ impl App {
             let _ = tx.send(actions::pick_folder(&start));
         });
         self.picking = Some(rx);
-        self.notice = Some("folder picker open… (check your other windows)".into());
+        self.set_notice("folder picker open… (check your other windows)".into());
     }
 
     /// No native dialogs here — fall back to the typed prompt.
@@ -2912,7 +2940,7 @@ impl App {
     fn change_folder_impl(&mut self, raw: &str, manual: bool) {
         let raw = raw.trim();
         if raw.is_empty() {
-            self.notice = Some("empty path".into());
+            self.set_notice("empty path".into());
             return;
         }
         let expanded = match raw.strip_prefix('~') {
@@ -2931,7 +2959,7 @@ impl App {
             target
         };
         if !target.is_dir() || std::env::set_current_dir(&target).is_err() {
-            self.notice = Some(format!("not a folder: {raw}"));
+            self.set_notice(format!("not a folder: {raw}"));
             return;
         }
         let root = std::env::current_dir().unwrap_or(target);
@@ -2943,7 +2971,7 @@ impl App {
         // Only confirm an explicit folder change; an automatic cwd-follow
         // re-root must not pop an unprompted "folder: …" notice.
         if manual {
-            self.notice = Some(format!("folder: {}", self.tree.root_name()));
+            self.set_notice(format!("folder: {}", self.tree.root_name()));
         }
     }
 
@@ -2958,14 +2986,14 @@ impl App {
         }
         if matches!(kind, PromptKind::CustomEditor) {
             if sidebar::save_editor_command(&input) {
-                self.notice = Some("custom editor saved; Enter still previews files".into());
+                self.set_notice("custom editor saved; Enter still previews files".into());
             } else {
-                self.notice = Some("custom editor command must be one non-empty line".into());
+                self.set_notice("custom editor command must be one non-empty line".into());
             }
             return;
         }
         let Some(name) = actions::validate_name(&input) else {
-            self.notice = Some("invalid name".into());
+            self.set_notice("invalid name".into());
             return;
         };
         let result = match &kind {
@@ -2985,7 +3013,7 @@ impl App {
                     self.select(index);
                 }
             }
-            Err(err) => self.notice = Some(format!("failed: {err}")),
+            Err(err) => self.set_notice(format!("failed: {err}")),
         }
     }
 
@@ -3003,7 +3031,7 @@ impl App {
             .unwrap_or_else(|| path.display().to_string());
         let result = Git::owner_of(path)
             .and_then(|repo| repo.stage_under(path).map(|done| (done, repo.name())));
-        self.notice = Some(match result {
+        self.set_notice(match result {
             // A stage that skipped everything needs saying WHY, or the
             // boundary rule reads as a silent no-op.
             Ok((done, _)) if done.count == 0 && done.skipped_nested > 0 => format!(
@@ -3441,7 +3469,7 @@ impl App {
         if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone())
             && let Some(notice) = herdr_sidebar::viewer::close_in_tab(&pane_id)
         {
-            self.notice = Some(notice);
+            self.set_notice(notice);
         }
     }
 
@@ -4797,6 +4825,14 @@ fn rebuild_tree_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notices_expire_unless_the_folder_picker_is_open() {
+        let fresh = NOTICE_LIFETIME - std::time::Duration::from_millis(1);
+        assert!(!notice_expired(fresh, false));
+        assert!(notice_expired(NOTICE_LIFETIME, false));
+        assert!(!notice_expired(NOTICE_LIFETIME * 10, true));
+    }
 
     #[test]
     fn collapse_button_hit_region_is_header_right_edge() {
